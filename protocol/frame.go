@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"crypto/x509" // 引入 x509 包以处理证书
-	"log" // 引入 log 以用于调试信息
 )
 
 // --- Vyper Initialization Frame 的结构 (此结构在 server.go 中被使用，因此此处也需要定义) ---
