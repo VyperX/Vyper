@@ -1,8 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"time"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -48,9 +51,9 @@ type ServerConfig struct {
 
 	// --- 填充模式定义 (服务器特有) ---
 	// 必填：服务器定义的填充模式列表。
-	# 客户端通过 initialPaddingRule 索引来选择。
-	# 可以包含多种模式，每种模式是一个数组，数组中包含 [min_length, max_length] 对。
-	# 客户端的 initialPaddingRule 0x01 对应 patterns[0], 0x02 对应 patterns[1]
+	// 客户端通过 initialPaddingRule 索引来选择。
+	// 可以包含多种模式，每种模式是一个数组，数组中包含 [min_length, max_length] 对。
+	// 客户端的 initialPaddingRule 0x01 对应 patterns[0], 0x02 对应 patterns[1]
 	PaddingPatterns [][]int `yaml:"paddingPatterns"`
 
 	// --- 回退地址 (可选，用于伪装) ---
@@ -123,8 +126,8 @@ func LoadServerConfig() (*ServerConfig, error) {
 	execDir := filepath.Dir(execPath)
 
 	configPaths := []string{
-		filepath.Join(execDir, "server_config.yaml"),            // server_config.yaml directly in executable dir
-		filepath.Join(execDir, "config", "server_config.yaml"), // config/server_config.yaml
+		filepath.Join(execDir, "server_config.yaml"),
+		filepath.Join(execDir, "config", "server_config.yaml"),
 	}
 
 	var data []byte
