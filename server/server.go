@@ -1,208 +1,252 @@
 package server
 
 import (
+	"bufio" // 用于读取HTTP请求
+	"bytes" // 用于构建HTTP响应
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
-	"os"
+	"math/rand"
+	"net/http" // 用于完整的HTTP请求和响应处理
+	"net/url" // 用于解析URL
 	"time"
 
-	"github.com/UltraTLS/UltraTLS/protocol" // Assuming this path contains your protocol definitions
-	"github.com/UltraTLS/UltraTLS/config"   // Your config package
-	"github.com/v2fly/v2ray-core/v5/common/net"
+	"github.com/UltraTLS/UltraTLS/protocol" // 假设 protocol 包在这里
+	"vyper/config" // 假设 config 包在这里
+	"github.com/v2fly/v2ray-core/v5/common/net" // 假设这个包可用
 )
 
-// ServerConfig holds the server's operational configuration,
-// primarily integrating with the loaded Vyper protocol settings.
+// ServerConfig 用于启动服务器的配置
 type ServerConfig struct {
-	// Loaded configuration from config.yaml
-	VyperConfig *config.Config
-	// Handler for accepted Vyper streams (proxy logic, e.g., to target)
-	Handler func(stream protocol.Stream)
+	ListenAddr    string
+	Handler       func(stream protocol.Stream) // Mux.Cool 层的处理函数
+	VyperConfig   *config.ServerConfig // 包含 Vyper 协议特有配置
 }
 
-// StartServer initializes and runs the Vyper server, handling TLS,
-// client authentication, and the initial Vyper handshake.
+// StartServer 启动 Vyper 服务器
 func StartServer(cfg *ServerConfig) error {
-	if cfg.VyperConfig == nil {
-		return fmt.Errorf("server configuration (VyperConfig) is nil")
-	}
-
-	// --- Load TLS Certificate and Key ---
+	// 加载 TLS 配置
 	tlsCert, err := tls.LoadX509KeyPair(cfg.VyperConfig.TLSCertPath, cfg.VyperConfig.TLSKeyPath)
 	if err != nil {
-		return fmt.Errorf("failed to load TLS certificate or key: %w", err)
+		return fmt.Errorf("无法加载 TLS 证书或密钥: %w", err)
 	}
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
-		MinVersion:   tls.VersionTLS12, // Recommended minimum version
-		// Add other TLS configurations as needed, e.g., CipherSuites, MaxVersion
+		MinVersion:   tls.VersionTLS12, // 建议至少 TLS 1.2
 	}
 
-	// --- Handle Client Certificate Authentication if enabled ---
 	if cfg.VyperConfig.TLSClientAuth {
-		if cfg.VyperConfig.TLSClientCaCertPath == "" {
-			return fmt.Errorf("TLS client authentication is enabled but TLSClientCaCertPath is not set")
-		}
-		caCertPool := protocol.NewCertPool() // Assuming protocol package has a NewCertPool
-		caCert, err := os.ReadFile(cfg.VyperConfig.TLSClientCaCertPath)
+		clientCACertPool, err := protocol.LoadCACertPool(cfg.VyperConfig.TLSClientCaCertPath)
 		if err != nil {
-			return fmt.Errorf("failed to read client CA certificate: %w", err)
+			return fmt.Errorf("无法加载客户端 CA 证书池: %w", err)
 		}
-		if !caCertPool.AppendCertsFromPEM(caCert) {
-			return fmt.Errorf("failed to parse client CA certificate")
-		}
-		tlsConfig.ClientCAs = caCertPool
-		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert // Or tls.VerifyClientCertIfGiven
+		tlsConfig.ClientCAs = clientCACertPool
+		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 	}
 
-	// --- Initialize TCP Listener ---
-	listenAddr := fmt.Sprintf("%s:%d", cfg.VyperConfig.ListenAddress, cfg.VyperConfig.ListenPort)
-	listener, err := tls.Listen("tcp", listenAddr, tlsConfig)
+	listener, err := tls.Listen("tcp", cfg.ListenAddr, tlsConfig)
 	if err != nil {
-		return fmt.Errorf("failed to start TLS listener on %s: %w", listenAddr, err)
+		return fmt.Errorf("服务器 TLS 监听失败: %w", err)
 	}
 	defer listener.Close()
-	log.Printf("Vyper server listening on %s", listenAddr)
+
+	log.Printf("Vyper 服务器正在监听 %s", cfg.ListenAddr)
 
 	for {
-		// --- Accept new TLS Connection ---
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("server accept TLS connection error: %v", err)
-			// Small delay to prevent tight looping on persistent errors
+			log.Printf("服务器接受连接错误: %v", err)
 			time.Sleep(time.Second)
 			continue
 		}
+		go func(rawConn net.Conn) {
+			defer rawConn.Close()
 
-		go func(serverConn net.Conn) {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("recovered from panic in client handler: %v", r)
-				}
-				serverConn.Close() // Ensure connection is closed on exit
-			}()
+			log.Printf("接收到来自 %s 的新连接", rawConn.RemoteAddr())
 
-			log.Printf("Accepted new connection from %s", serverConn.RemoteAddr())
-
-			// --- Vyper Protocol Handshake: Read Initialization Frame ---
-			// We expect the first bytes to be the Vyper Initialization Frame.
-			// Define a buffer for the initial read (e.g., max size of initial frame)
-			// AuthBlob Length (2) + AuthBlob (e.g., 64) + InitialPaddingRule (1) + Reserved (3) + ClientInfo Length (2) = 72 bytes + ClientInfo length
-			// Let's assume a reasonable max for client info, e.g., 256 bytes, so 72 + 256 = 328 bytes for the initial buffer.
-			// Or, more robustly, read piece by piece.
-
-			// Temporarily use a buffered reader for byte-by-byte parsing
-			// For simplicity here, we'll assume a direct read of structured data.
-			// In a real implementation, you'd use bufio.Reader to peek/read exact lengths.
-
-			// Read AuthBlob Length
-			var authBlobLen uint16
-			if err := protocol.ReadBytes(serverConn, &authBlobLen); err != nil { // Assuming protocol.ReadBytes reads big-endian uint16
-				log.Printf("failed to read AuthBlob Length from %s: %v", serverConn.RemoteAddr(), err)
-				protocol.SendErrorAndClose(serverConn, "Protocol error: missing AuthBlob Length") // Assuming this helper exists
-				return
-			}
-			if authBlobLen == 0 || authBlobLen > 256 { // Arbitrary max length for sanity check
-				log.Printf("invalid AuthBlob Length %d from %s", authBlobLen, serverConn.RemoteAddr())
-				protocol.SendErrorAndClose(serverConn, "Protocol error: invalid AuthBlob Length")
-				return
-			}
-
-			// Read AuthBlob
-			authBlob := make([]byte, authBlobLen)
-			if _, err := serverConn.Read(authBlob); err != nil {
-				log.Printf("failed to read AuthBlob from %s: %v", serverConn.RemoteAddr(), err)
-				protocol.SendErrorAndClose(serverConn, "Protocol error: missing AuthBlob")
-				return
-			}
-
-			// --- Authenticate Client ---
-			if string(authBlob) != cfg.VyperConfig.AuthToken { // Simple string comparison for authToken, convert Base64 to byte slice in real app
-				log.Printf("Authentication failed for %s: invalid AuthBlob", serverConn.RemoteAddr())
+			// --- Vyper 协议认证阶段 ---
+			initFrame, err := protocol.ReadVyperInitializationFrame(rawConn)
+			if err != nil {
+				log.Printf("读取 Vyper 初始化帧失败 (%s): %v", rawConn.RemoteAddr(), err)
 				if cfg.VyperConfig.FallbackAddress != "" {
-					// Implement fallback to HTTP or other L7 service
-					log.Printf("Falling back %s to %s", serverConn.RemoteAddr(), cfg.VyperConfig.FallbackAddress)
-					// This part is complex and typically involves hijacking the TCP stream
-					// to proxy to the fallback address. For this example, we'll just log
-					// and close if we don't have a full HTTP proxy handler here.
-					protocol.ServeFallback(serverConn, cfg.VyperConfig.FallbackAddress) // Assuming this helper exists
-				} else {
-					protocol.SendErrorAndClose(serverConn, "Authentication failed")
+					handleFallback(rawConn, cfg.VyperConfig.FallbackAddress)
 				}
 				return
 			}
-			log.Printf("Authentication successful for %s", serverConn.RemoteAddr())
 
-			// Read InitialPaddingRule, Reserved, ClientInfo Length, ClientInfo
-			var initialPaddingRule uint8
-			if err := protocol.ReadBytes(serverConn, &initialPaddingRule); err != nil { // Assuming protocol.ReadBytes for uint8
-				log.Printf("failed to read InitialPaddingRule from %s: %v", serverConn.RemoteAddr(), err)
-				protocol.SendErrorAndClose(serverConn, "Protocol error: missing InitialPaddingRule")
-				return
-			}
-
-			reservedBytes := make([]byte, 3)
-			if _, err := serverConn.Read(reservedBytes); err != nil {
-				log.Printf("failed to read Reserved bytes from %s: %v", serverConn.RemoteAddr(), err)
-				protocol.SendErrorAndClose(serverConn, "Protocol error: missing Reserved bytes")
-				return
-			}
-			// Server MUST ignore Reserved bytes as per SPEC. No validation needed for content.
-
-			var clientInfoLen uint16
-			if err := protocol.ReadBytes(serverConn, &clientInfoLen); err != nil { // Assuming protocol.ReadBytes for uint16
-				log.Printf("failed to read ClientInfo Length from %s: %v", serverConn.RemoteAddr(), err)
-				protocol.SendErrorAndClose(serverConn, "Protocol error: missing ClientInfo Length")
-				return
-			}
-			if clientInfoLen > 512 { // Sanity check for ClientInfo length
-				log.Printf("invalid ClientInfo Length %d from %s", clientInfoLen, serverConn.RemoteAddr())
-				protocol.SendErrorAndClose(serverConn, "Protocol error: invalid ClientInfo Length")
-				return
-			}
-
-			clientInfo := make([]byte, clientInfoLen)
-			if clientInfoLen > 0 {
-				if _, err := serverConn.Read(clientInfo); err != nil {
-					log.Printf("failed to read ClientInfo from %s: %v", serverConn.RemoteAddr(), err)
-					protocol.SendErrorAndClose(serverConn, "Protocol error: missing ClientInfo")
-					return
+			// 验证 AuthBlob
+			if string(initFrame.AuthBlob) != cfg.VyperConfig.AuthToken {
+				log.Printf("AuthBlob 验证失败 (%s): AuthBlob不匹配", rawConn.RemoteAddr())
+				if cfg.VyperConfig.FallbackAddress != "" {
+					handleFallback(rawConn, cfg.VyperConfig.FallbackAddress)
 				}
+				return
 			}
-			log.Printf("Client %s details: InitialPaddingRule=%d, ClientInfo='%s'",
-				serverConn.RemoteAddr(), initialPaddingRule, string(clientInfo))
 
-			// --- Vyper Session Start ---
-			// Now, the TLS connection is authenticated and the initial handshake is complete.
-			// We establish the Mux session over this connection.
-			session := protocol.NewSession(serverConn)
+			// 计算并验证 SessionToken
+			currentTimeSeconds := time.Now().Unix()
+			sessionTokenData := make([]byte, 8)
+			binary.BigEndian.PutUint64(sessionTokenData[:], uint64(currentTimeSeconds))
+			sessionTokenData = append(sessionTokenData, []byte(cfg.VyperConfig.AuthToken)...)
+
+			hasher := sha256.New()
+			hasher.Write(sessionTokenData)
+			sessionTokenHash := hasher.Sum(nil)
+			expectedSessionToken := sessionTokenHash[:4]
+
+			// 从 ClientInfo 中解析伪 HTTP 请求，并提取 SessionToken
+			// 假定 ClientInfo 包含一个完整的 HTTP 请求行，且路径是 "/SessionToken/<Base64编码的SessionToken>"
+			req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader([]byte(initFrame.ClientInfo))))
+			if err != nil {
+				log.Printf("解析 Vyper Initialization Frame 中的伪 HTTP 请求失败 (%s): %v", rawConn.RemoteAddr(), err)
+				if cfg.VyperConfig.FallbackAddress != "" {
+					handleFallback(rawConn, cfg.VyperConfig.FallbackAddress)
+				}
+				return
+			}
+
+			if req.Method != "GET" {
+				log.Printf("伪 HTTP 请求方法不是 GET (%s): %s", rawConn.RemoteAddr(), req.Method)
+				if cfg.VyperConfig.FallbackAddress != "" {
+					handleFallback(rawConn, cfg.VyperConfig.FallbackAddress)
+				}
+				return
+			}
+
+			// 解析请求路径，提取 SessionToken
+			if !bytes.HasPrefix([]byte(req.URL.Path), []byte("/SessionToken/")) {
+				log.Printf("伪 HTTP 请求路径格式不正确 (%s): %s", rawConn.RemoteAddr(), req.URL.Path)
+				if cfg.VyperConfig.FallbackAddress != "" {
+					handleFallback(rawConn, cfg.VyperConfig.FallbackAddress)
+				}
+				return
+			}
+
+			base64EncodedToken := req.URL.Path[len("/SessionToken/"):]
+			decodedToken, decodeErr := protocol.Base64Decode(base64EncodedToken)
+			if decodeErr != nil {
+				log.Printf("SessionToken Base64解码失败 (%s): %v", rawConn.RemoteAddr(), decodeErr)
+				if cfg.VyperConfig.FallbackAddress != "" {
+					handleFallback(rawConn, cfg.VyperConfig.FallbackAddress)
+				}
+				return
+			}
+			clientSessionToken := string(decodedToken)
+
+			if clientSessionToken != string(expectedSessionToken) {
+				log.Printf("SessionToken 验证失败 (%s): 客户端 %x, 预期 %x", rawConn.RemoteAddr(), clientSessionToken, expectedSessionToken)
+				if cfg.VyperConfig.FallbackAddress != "" {
+					handleFallback(rawConn, cfg.VyperConfig.FallbackAddress)
+				}
+				return
+			}
+
+			log.Printf("Vyper 客户端 %s 认证成功", rawConn.RemoteAddr())
+
+			// 认证成功：发送填充帧作为确认 (900-1400字节)
+			paddingLen := rand.Intn(501) + 900 // 900 到 1400 之间
+			padData := make([]byte, paddingLen)
+			rand.Read(padData)
+
+			padFrame := protocol.NewPadFrame(padData)
+			if _, err := protocol.WriteFrame(rawConn, padFrame); err != nil {
+				log.Printf("发送认证成功填充帧失败 (%s): %v", rawConn.RemoteAddr(), err)
+				return
+			}
+
+			// 认证成功且填充帧发送后，建立 mux session
+			session := protocol.NewSession(rawConn)
 			defer session.Close()
 
-			// --- Continuously Accept Mux Streams ---
+			// 持续接受子流
 			for {
-				// AcceptStream will block until a new stream (e.g., REQ_FRAME) arrives,
-				// or the underlying connection closes/errors.
-				// The Vyper protocol framing (REQ_FRAME, DATA_FRAME, etc.)
-				// is handled internally by protocol.NewSession and session.AcceptStream.
-				// This assumes `protocol.NewSession` abstracts the Vyper session frame parsing.
 				stream, _, err := session.AcceptStream()
 				if err != nil {
-					// Log specific errors for better diagnostics
-					if err == protocol.ErrSessionClosed || err == os.EOF { // Assuming these error types exist
-						log.Printf("client %s session closed gracefully.", serverConn.RemoteAddr())
-					} else {
-						log.Printf("server accept mux stream from %s error: %v", serverConn.RemoteAddr(), err)
-					}
-					break // Break from inner loop to close the connection
+					log.Printf("服务器接受 Mux 子流错误 (%s): %v", rawConn.RemoteAddr(), err)
+					break
 				}
-
-				// Hand the accepted stream to the configured handler for proxying.
-				// The handler is responsible for reading/writing Vyper DATA_FRAMEs
-				// via the provided 'stream' interface.
+				log.Printf("服务器接受到新的 Mux 子流 (%s)", rawConn.RemoteAddr())
 				go cfg.Handler(stream)
 			}
 		}(conn)
+	}
+}
+
+// handleFallback 处理认证失败后的 HTTP Fallback
+// 它将客户端的请求转发到 fallbackAddr，并将响应写回客户端。
+func handleFallback(conn net.Conn, fallbackAddr string) {
+	log.Printf("触发 Fallback 到 %s", fallbackAddr)
+
+	// 使用 bufio.Reader 从连接中读取，以便 http.ReadRequest 可以正确解析
+	reader := bufio.NewReader(conn)
+	req, err := http.ReadRequest(reader)
+	if err != nil {
+		log.Printf("读取 Fallback HTTP 请求失败 (%s): %v", conn.RemoteAddr(), err)
+		// 尝试发送一个错误响应，然后关闭连接
+		sendHTTPError(conn, http.StatusBadRequest, "Invalid HTTP Request")
+		return
+	}
+
+	// 解析 fallbackAddress
+	fallbackURL, err := url.Parse(fallbackAddr)
+	if err != nil {
+		log.Printf("解析 Fallback URL 失败 (%s): %v", conn.RemoteAddr(), err)
+		sendHTTPError(conn, http.StatusInternalServerError, "Server Fallback Misconfiguration")
+		return
+	}
+
+	// 调整请求以转发到 fallbackAddr
+	req.RequestURI = "" // 必须清空此字段，否则 http.Client.Do 会出错
+	req.URL.Host = fallbackURL.Host
+	req.URL.Scheme = fallbackURL.Scheme
+	req.URL.Opaque = fallbackURL.Opaque // 保留不透明路径
+
+	// 使用 http.Client 发送请求
+	client := &http.Client{
+		// 配置客户端以跟随重定向，处理 TLS 等
+		// 可以设置 Timeout
+		Timeout: 10 * time.Second, // Fallback 请求的超时
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("转发 Fallback 请求到 %s 失败 (%s): %v", fallbackAddr, conn.RemoteAddr(), err)
+		sendHTTPError(conn, http.StatusBadGateway, "Fallback Target Unreachable")
+		return
+	}
+	defer resp.Body.Close()
+
+	// 将响应写回原始连接
+	err = resp.Write(conn)
+	if err != nil {
+		log.Printf("写入 Fallback 响应到客户端失败 (%s): %v", conn.RemoteAddr(), err)
+		// 连接可能会在这里中断，无需发送更多错误
+	}
+
+	log.Printf("已处理 Fallback 请求，关闭连接 %s", conn.RemoteAddr())
+}
+
+// sendHTTPError 向连接发送一个简单的 HTTP 错误响应
+func sendHTTPError(w io.Writer, statusCode int, message string) {
+	resp := &http.Response{
+		Status:     http.StatusText(statusCode),
+		StatusCode: statusCode,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewBufferString(message + "\n")),
+	}
+	resp.Header.Set("Connection", "close")
+	resp.Header.Set("Content-Type", "text/plain")
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(message)+1))
+
+	err := resp.Write(w)
+	if err != nil {
+		log.Printf("发送 HTTP 错误响应失败: %v", err)
 	}
 }
