@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"io"
 	"time"
 	// crypto/x509 和 os 不需要在此处导入，因为 LoadCACertPool 已被移除到通用部分
 	// 并且其内部逻辑已由外部文件提供。
