@@ -1,15 +1,12 @@
 package config
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
-
 	"gopkg.in/yaml.v3"
 )
 
-// Config 包含了 Vyper 客户端的所有配置参数。
-// 结构扁平化，符合您期望的风格。
+// Config 是客户端的配置结构，保持原样
 type Config struct {
 	// --- 基础连接与核心 Vyper 参数 (您的原始参数) ---
 	ServerIP           string `yaml:"server_ip"`           // 必填：Vyper 服务器的 IP 地址或域名
@@ -18,11 +15,11 @@ type Config struct {
 	BufferSize         int    `yaml:"buffer_size"`         // 可选：数据传输缓冲区大小 (字节)
 	Timeout            int    `yaml:"timeout"`             // 可选：连接超时时间 (秒)
 
-	// --- Vyper 协议特有参数 ---
+	// --- Vyper 协议特有参数 (客户端部分) ---
 	InitialPaddingRule int    `yaml:"initialPaddingRule"`  // 必填：初始填充规则索引 (0-255)
 	ClientInfo         string `yaml:"clientInfo"`          // 可选：客户端软件信息字符串
 
-	// --- TLS (传输层安全) 配置 ---
+	// --- TLS (传输层安全) 配置 (客户端部分) ---
 	TLSEnabled         bool   `yaml:"tlsEnabled"`          // 必填：是否启用 TLS (Vyper 协议必须为 true)
 	TLSServerName      string `yaml:"tlsServerName"`       // 必填：TLS SNI (Server Name Indication)
 	TLSInsecureSkipVerify bool   `yaml:"tlsInsecureSkipVerify"` // 必填：是否跳过服务器证书验证 (生产环境应为 false)
@@ -30,37 +27,60 @@ type Config struct {
 	TLSClientCertPath  string `yaml:"tlsClientCertPath"`   // 可选：客户端 TLS 证书路径 (PEM 格式，如果服务器需要)
 	TLSClientKeyPath   string `yaml:"tlsClientKeyPath"`    // 可选：客户端 TLS 私钥路径 (PEM 格式)
 
-	// --- 本地代理监听配置 ---
+	// --- 本地代理监听配置 (客户端部分) ---
 	ProxyListenAddress string `yaml:"proxyListenAddress"`  // 必填：本地代理监听地址
 	ProxyListenPort    int    `yaml:"proxyListenPort"`     // 必填：本地代理监听端口
 	ProxyProtocol      string `yaml:"proxyProtocol"`       // 可选：本地代理协议类型 (例如 "socks5", "http")
 }
 
-// LoadConfig 读取并解析 config.yaml 文件中的客户端配置。
-// 它会在可执行文件目录及其 'config' 子目录中查找 config.yaml。
-func LoadConfig() (*Config, error) {
+// ServerConfig 包含了 Vyper 服务器的所有配置参数。
+type ServerConfig struct {
+	// --- 基础监听与核心 Vyper 参数 ---
+	ListenAddr    string `yaml:"listenAddr"`    // 必填：服务器监听地址 (例如 "0.0.0.0:443")
+	AuthToken     string `yaml:"authToken"`     // 必填：用于认证的预共享 Auth Token (Base64 编码)
+
+	// --- TLS (传输层安全) 配置 ---
+	TLSEnabled    bool   `yaml:"tlsEnabled"`    // 必填：是否启用 TLS (Vyper 协议必须为 true)
+	TLSCertPath   string `yaml:"tlsCertPath"`   // 必填：服务器证书链文件路径 (PEM 格式)
+	TLSKeyPath    string `yaml:"tlsKeyPath"`    // 必填：服务器私钥文件路径 (PEM 格式)
+	TLSClientAuth bool   `yaml:"tlsClientAuth"` // 可选：是否启用客户端证书认证
+	TLSClientCaCertPath string `yaml:"tlsClientCaCertPath"` // 可选：用于验证客户端证书的 CA 证书路径
+
+	// --- 填充模式定义 (服务器特有) ---
+	// 必填：服务器定义的填充模式列表。
+	# 客户端通过 initialPaddingRule 索引来选择。
+	# 可以包含多种模式，每种模式是一个数组，数组中包含 [min_length, max_length] 对。
+	# 客户端的 initialPaddingRule 0x01 对应 patterns[0], 0x02 对应 patterns[1]
+	PaddingPatterns [][]int `yaml:"paddingPatterns"`
+
+	// --- 回退地址 (可选，用于伪装) ---
+	FallbackAddress string `yaml:"fallbackAddress"` // 可选：Auth Token 验证失败或协议错误时的 L7 服务回退地址
+}
+
+// LoadClientConfig 读取并解析客户端配置。
+// 不处理可选参数的默认值。
+func LoadClientConfig() (*Config, error) {
 	execPath, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("无法获取可执行文件路径: %w", err)
 	}
 	execDir := filepath.Dir(execPath)
 
-	// 定义 config.yaml 的可能路径
 	configPaths := []string{
-		filepath.Join(execDir, "config.yaml"),            // 可执行文件目录下
-		filepath.Join(execDir, "config", "config.yaml"), // config/config.yaml
+		filepath.Join(execDir, "config.yaml"),
+		filepath.Join(execDir, "config", "config.yaml"),
 	}
 
 	var data []byte
 	var foundPath string
 	for _, p := range configPaths {
-		if _, err := os.Stat(p); err == nil { // 检查文件是否存在
+		if _, err := os.Stat(p); err == nil {
 			data, err = os.ReadFile(p)
 			if err != nil {
 				return nil, fmt.Errorf("无法读取配置文件 %s: %w", p, err)
 			}
 			foundPath = p
-			break // 找到文件，停止搜索
+			break
 		}
 	}
 
@@ -73,7 +93,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("无法解析配置文件 %s: %w", foundPath, err)
 	}
 
-	// --- 基本验证和默认值设置 ---
+	// --- 客户端基本验证 (不处理可选参数的默认值) ---
 	if cfg.ServerIP == "" || cfg.ServerPort == 0 {
 		return nil, fmt.Errorf("缺少 Vyper 服务器连接基本信息 (server_ip, server_port)")
 	}
@@ -90,12 +110,63 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("缺少本地代理监听信息 (proxyListenAddress, proxyListenPort)")
 	}
 
-	// 设置默认值 (如果未提供)
-	if cfg.BufferSize == 0 {
-		cfg.BufferSize = 4096 // 默认缓冲区大小为 4096 字节
+	return &cfg, nil
+}
+
+// LoadServerConfig 读取并解析服务器配置。
+// 不处理可选参数的默认值。
+func LoadServerConfig() (*ServerConfig, error) {
+	execPath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("无法获取可执行文件路径: %w", err)
 	}
-	if cfg.Timeout == 0 {
-		cfg.Timeout = 30 // 默认连接超时为 30 秒
+	execDir := filepath.Dir(execPath)
+
+	configPaths := []string{
+		filepath.Join(execDir, "server_config.yaml"),            // server_config.yaml directly in executable dir
+		filepath.Join(execDir, "config", "server_config.yaml"), // config/server_config.yaml
+	}
+
+	var data []byte
+	var foundPath string
+	for _, p := range configPaths {
+		if _, err := os.Stat(p); err == nil {
+			data, err = os.ReadFile(p)
+			if err != nil {
+				return nil, fmt.Errorf("无法读取服务器配置文件 %s: %w", p, err)
+			}
+			foundPath = p
+			break
+		}
+	}
+
+	if data == nil {
+		return nil, fmt.Errorf("在预期位置未找到 server_config.yaml: %v", configPaths)
+	}
+
+	var cfg ServerConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("无法解析服务器配置文件 %s: %w", foundPath, err)
+	}
+
+	// --- 服务器基本验证 (不处理可选参数的默认值) ---
+	if cfg.ListenAddr == "" {
+		return nil, fmt.Errorf("listenAddr 缺失，服务器监听地址必需")
+	}
+	if cfg.AuthToken == "" {
+		return nil, fmt.Errorf("authToken 缺失，认证必需")
+	}
+	if !cfg.TLSEnabled {
+		return nil, fmt.Errorf("TLS 必须启用 (tlsEnabled 需为 true)")
+	}
+	if cfg.TLSCertPath == "" || cfg.TLSKeyPath == "" {
+		return nil, fmt.Errorf("TLS 启用时，tlsCertPath 和 tlsKeyPath 必需")
+	}
+	if cfg.TLSClientAuth && cfg.TLSClientCaCertPath == "" {
+		return nil, fmt.Errorf("TLS 客户端认证启用时，tlsClientCaCertPath 必需")
+	}
+	if len(cfg.PaddingPatterns) == 0 {
+		return nil, fmt.Errorf("paddingPatterns 列表不能为空")
 	}
 
 	return &cfg, nil
