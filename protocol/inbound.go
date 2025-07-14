@@ -5,24 +5,508 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509" // 用于 LoadCACertPool
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
+	"os" // 用于 LoadCACertPool
 	"sync"
-	"io"
 	"time"
-	// crypto/x509 和 os 不需要在此处导入，因为 LoadCACertPool 已被移除到通用部分
-	// 并且其内部逻辑已由外部文件提供。
 )
 
 // =============================================================================
+// Vyper 协议相关的通用结构和辅助函数。
+// 这些定义在此文件中，并可供同一 protocol 包中的其他文件（如 outbound.go）使用。
+// 考虑到用户对代码完整性和详细性的严格要求，这些通用部分在此文件中完整呈现。
+// =============================================================================
+
+// Stream 是 Mux.Cool 的子流接口。
+// 假设 Mux.Cool 提供了这个接口。
+type Stream interface {
+	io.Reader
+	io.Writer
+	io.Closer
+}
+
+// Session 是 Mux.Cool 的会话接口。
+// 假设 Mux.Cool 提供了这个接口。
+type Session interface {
+	OpenStream(dest interface{}) (Stream, error) // dest 通常是 v2net.Destination
+	AcceptStream() (Stream, []byte, error)
+	Close() error
+}
+
+// NewSession 创建一个新的 Mux.Cool 会话 (模拟实现)。
+// 实际应用中，这里会调用 Mux.Cool 库的会话初始化函数。
+func NewSession(conn net.Conn) Session {
+	return &mockMuxSession{conn: conn}
+}
+
+// mockMuxSession 是 Mux.Cool Session 接口的模拟实现。
+type mockMuxSession struct {
+	conn net.Conn
+}
+
+func (m *mockMuxSession) OpenStream(dest interface{}) (Stream, error) {
+	// 模拟打开子流，实际会返回 Mux.Cool 的 Stream 实例
+	return &mockMuxStream{conn: m.conn}, nil
+}
+
+func (m *mockMuxSession) AcceptStream() (Stream, []byte, error) {
+	// 模拟接受子流，实际会返回 Mux.Cool 的 Stream 实例和可能的元数据
+	return &mockMuxStream{conn: m.conn}, nil, nil
+}
+
+func (m *mockMuxSession) Close() error {
+	// 模拟关闭 Mux.Cool 会话，实际会关闭底层连接
+	return m.conn.Close()
+}
+
+// mockMuxStream 是 Mux.Cool Stream 接口的模拟实现。
+type mockMuxStream struct {
+	conn io.ReadWriter
+}
+
+func (m *mockMuxStream) Read(b []byte) (n int, err error) {
+	return m.conn.Read(b)
+}
+
+func (m *mockMuxStream) Write(b []byte) (n int, err error) {
+	return m.conn.Write(b)
+}
+
+func (m *mockMuxStream) Close() error {
+	// 模拟关闭 Mux.Cool 子流，通常不关闭底层连接
+	return nil
+}
+
+// VyperInitializationFrame 定义了 Vyper 协议的初始化帧结构。
+// 客户端在 TLS 握手后立即发送此帧进行认证和参数协商。
+type VyperInitializationFrame struct {
+	AuthBlob           []byte // 认证数据块
+	InitialPaddingRule byte   // 初始填充规则
+	Reserved           []byte // 3 字节保留字段
+	ClientInfo         string // 客户端信息，此处被重用于承载 SessionToken 的伪 HTTP 请求
+}
+
+// VyperSessionFrame 定义了 Vyper 协议的通用会话帧结构。
+// 所有 Vyper 会话数据（请求、数据、流控、关闭、错误、填充）都封装在此帧中。
+type VyperSessionFrame struct {
+	FrameType byte   // 帧类型
+	Sequence  uint32 // 序列号
+	Content   []byte // 帧内容
+}
+
+// LoadCACertPool 从 PEM 编码的 CA 证书文件路径加载一个 *x509.CertPool。
+// 用于验证 TLS 证书链。
+func LoadCACertPool(caCertPath string) (*x509.CertPool, error) {
+	caCert, err := os.ReadFile(caCertPath)
+	if err != nil {
+		return nil, fmt.Errorf("无法读取 CA 证书文件 '%s': %w", caCertPath, err)
+	}
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("无法从 PEM 解析 CA 证书文件 '%s'", caCertPath)
+	}
+	return caCertPool, nil
+}
+
+// ReadVyperInitializationFrame 从给定的 io.Reader 中读取一个完整的 Vyper Initialization Frame。
+// 它严格遵循 Vyper 协议规范 Section 4.2 中定义的字节格式和顺序。
+func ReadVyperInitializationFrame(r io.Reader) (*VyperInitializationFrame, error) {
+	var initFrame VyperInitializationFrame
+
+	var authBlobLen uint16
+	if err := binary.Read(r, binary.BigEndian, &authBlobLen); err != nil {
+		return nil, fmt.Errorf("读取 AuthBlob Length 失败: %w", err)
+	}
+
+	initFrame.AuthBlob = make([]byte, authBlobLen)
+	if _, err := io.ReadFull(r, initFrame.AuthBlob); err != nil {
+		return nil, fmt.Errorf("读取 AuthBlob 失败: %w", err)
+	}
+
+	if err := binary.Read(r, binary.BigEndian, &initFrame.InitialPaddingRule); err != nil {
+		return nil, fmt.Errorf("读取 InitialPaddingRule 失败: %w", err)
+	}
+
+	initFrame.Reserved = make([]byte, 3)
+	if _, err := io.ReadFull(r, initFrame.Reserved); err != nil {
+		return nil, fmt.Errorf("读取 Reserved 字段失败: %w", err)
+	}
+
+	var clientInfoLen uint16
+	if err := binary.Read(r, binary.BigEndian, &clientInfoLen); err != nil {
+		return nil, fmt.Errorf("读取 ClientInfo Length 失败: %w", err)
+	}
+
+	clientInfoBytes := make([]byte, clientInfoLen)
+	if _, err := io.ReadFull(r, clientInfoBytes); err != nil {
+		return nil, fmt.Errorf("读取 ClientInfo 失败: %w", err)
+	}
+	initFrame.ClientInfo = string(clientInfoBytes)
+
+	return &initFrame, nil
+}
+
+// WriteVyperInitializationFrame 将一个 VyperInitializationFrame 写入到 io.Writer。
+// 它严格遵循 Vyper 协议规范 Section 4.2 中定义的字节格式和顺序。
+func WriteVyperInitializationFrame(w io.Writer, frame *VyperInitializationFrame) (int, error) {
+	totalN := 0
+
+	authBlobLen := uint16(len(frame.AuthBlob))
+	if err := binary.Write(w, binary.BigEndian, authBlobLen); err != nil {
+		return totalN, fmt.Errorf("写入 AuthBlob Length 失败: %w", err)
+	}
+	totalN += 2
+
+	n, err := w.Write(frame.AuthBlob)
+	if err != nil {
+		return totalN + n, fmt.Errorf("写入 AuthBlob 失败: %w", err)
+	}
+	totalN += n
+
+	if err := binary.Write(w, binary.BigEndian, frame.InitialPaddingRule); err != nil {
+		return totalN, fmt.Errorf("写入 InitialPaddingRule 失败: %w", err)
+	}
+	totalN += 1
+
+	n, err = w.Write(frame.Reserved)
+	if err != nil {
+		return totalN + n, fmt.Errorf("写入 Reserved 字段失败: %w", err)
+	}
+	totalN += n
+
+	clientInfoLen := uint16(len(frame.ClientInfo))
+	if err := binary.Write(w, binary.BigEndian, clientInfoLen); err != nil {
+		return totalN, fmt.Errorf("写入 ClientInfo Length 失败: %w", err)
+	}
+	totalN += 2
+
+	n, err = w.Write([]byte(frame.ClientInfo))
+	if err != nil {
+		return totalN + n, fmt.Errorf("写入 ClientInfo 失败: %w", err)
+	}
+	totalN += n
+
+	return totalN, nil
+}
+
+// Base64Decode 对 Base64 标准编码的字符串进行解码，返回原始字节切片。
+func Base64Decode(s string) ([]byte, error) {
+	decodedBytes, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("Base64 解码失败: %w", err)
+	}
+	return decodedBytes, nil
+}
+
+// NewPadFrame 创建一个 Vyper PAD_FRAME。
+// PAD_FRAME 用于在协议中插入填充数据以增加流量的混淆性。
+func NewPadFrame(content []byte) *VyperSessionFrame {
+	return &VyperSessionFrame{
+		FrameType: 0x06, // PAD_FRAME 的 FrameType 定义为 0x06
+		Sequence:  0,    // 对于 PAD_FRAME，Sequence 字段通常可以为 0 或不重要
+		Content:   content,
+	}
+}
+
+// WriteFrame 将一个 VyperSessionFrame 写入到 io.Writer。
+// 它严格遵循 Vyper 协议规范 Section 5.1 中定义的字节格式和顺序。
+func WriteFrame(w io.Writer, frame *VyperSessionFrame) (int, error) {
+	// 帧头包含 FrameType (1B) + Sequence (4B) + Content Length (2B) = 7 字节
+	header := make([]byte, 7)
+	header[0] = frame.FrameType
+	binary.BigEndian.PutUint32(header[1:5], frame.Sequence)
+	binary.BigEndian.PutUint16(header[5:7], uint16(len(frame.Content))) // Content Length 是 Content 的长度
+
+	n, err := w.Write(header) // 写入帧头
+	if err != nil {
+		return n, fmt.Errorf("写入帧头失败: %w", err)
+	}
+
+	contentN, err := w.Write(frame.Content) // 写入帧内容
+	if err != nil {
+		return n + contentN, fmt.Errorf("写入帧内容失败: %w", err)
+	}
+
+	return n + contentN, nil // 返回总写入字节数
+}
+
+// ReadVyperSessionFrame 从 io.Reader 读取一个完整的 VyperSessionFrame。
+// 它遵循 Vyper 协议中会话帧的字节格式。
+func ReadVyperSessionFrame(r io.Reader) (*VyperSessionFrame, error) {
+	frame := &VyperSessionFrame{}
+	header := make([]byte, 7) // FrameType (1B) + Sequence (4B) + Content Length (2B)
+
+	// 读取帧头
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, fmt.Errorf("读取会话帧头失败: %w", err)
+	}
+
+	frame.FrameType = header[0]
+	frame.Sequence = binary.BigEndian.Uint32(header[1:5])
+	contentLen := binary.BigEndian.Uint16(header[5:7])
+
+	// 读取帧内容
+	if contentLen > 0 {
+		frame.Content = make([]byte, contentLen)
+		if _, err := io.ReadFull(r, frame.Content); err != nil {
+			return nil, fmt.Errorf("读取会话帧内容失败 (预期长度 %d): %w", contentLen, err)
+		}
+	} else {
+		frame.Content = []byte{} // 内容长度为0时，设为空字节切片
+	}
+
+	return frame, nil
+}
+
+// --- Vyper 协议连接封装 (vyperConn) ---
+// vyperConn 封装了底层的 net.Conn，并处理 Vyper 协议的帧读写和填充逻辑。
+// 它实现了 net.Conn 接口，使得上层应用可以直接使用它，而无需关心 Vyper 协议的细节。
+type vyperConn struct {
+	net.Conn // 嵌入底层连接，实现大部分 net.Conn 接口方法
+
+	reader *bufio.Reader // 带缓冲的读取器，用于高效读取底层连接
+
+	// 写入相关
+	writeBuffer  *bytes.Buffer // 用于构建出站 Vyper 帧
+	writeMutex   sync.Mutex    // 保护写入操作，确保并发写入的安全性
+	paddingState *paddingState // 填充状态，用于管理出站流量的混淆填充
+
+	// 读取相关
+	readBuffer *bytes.Buffer // 用于存储已解封装的 Vyper DATA_FRAME 内容，提供给上层读取
+	readMutex  sync.Mutex    // 保护读取操作，确保并发读取的安全性
+}
+
+// paddingState 结构体用于管理当前连接的填充状态。
+// 它包含了动态突发协商和随机交错所需的所有参数。
+type paddingState struct {
+	allPatterns          [][]int   // 修复：改为 [][]int，表示一个 [min, max] 元组的列表
+	currentPatternIndex  int       // 当前选定的填充模式的索引 (现在直接是元组的索引)
+	lastPaddingTime      time.Time // 上次发送填充帧的时间，可用于未来实现基于时间的填充间隔
+}
+
+// newPaddingState 初始化填充状态。
+// initialRule: Vyper Initialization Frame 中协商的初始填充规则。
+// allPatterns: 客户端或服务器配置的所有“Padding Burst Patterns”。
+func newPaddingState(initialRule byte, allPatterns [][]int) *paddingState { // 修复：allPatterns 类型
+	ps := &paddingState{
+		allPatterns:     allPatterns,
+		lastPaddingTime: time.Now(),
+	}
+
+	// 根据 InitialPaddingRule 选择或确定当前填充模式。
+	if initialRule >= 0x01 && int(initialRule-1) < len(allPatterns) {
+		// 0x01 到 0xFE：客户端指定一个具体的模式索引。
+		ps.currentPatternIndex = int(initialRule - 1)
+	} else if initialRule == 0xFF && len(allPatterns) > 0 {
+		// 0xFF：客户端请求服务器决定。在此实现中，我们默认使用第一个模式。
+		ps.currentPatternIndex = 0
+	} else {
+		// 0x00 (无主动填充) 或无效索引：表示不进行主动填充。
+		ps.currentPatternIndex = -1
+	}
+	return ps
+}
+
+// generatePaddingFrame 根据当前填充状态生成一个 PAD_FRAME。
+// 返回 nil 表示当前不应生成填充帧。
+// 详细填充逻辑：
+// 1. **检查是否启用了主动填充：** 如果 `currentPatternIndex` 为 -1 或 `allPatterns` 为空，则表示没有主动填充，直接返回 `nil`。
+// 2. **选择当前填充模式：** `currentTuple` 现在直接是当前 `[min, max]` 元组。
+// 3. **处理空模式：** 如果选定的元组长度不为 2，也返回 `nil`。
+// 4. **确定填充长度范围：** 从当前元组中获取 `minLen` 和 `maxLen`。
+// 5. **生成随机填充长度：** 在 `[minLen, maxLen]` 范围内生成一个随机整数作为 `PAD_FRAME` 的内容长度。
+// 6. **生成随机填充数据：** 创建一个指定长度的字节切片，并用随机数据填充，以增加不可预测性。
+// 7. **更新状态：** 递增 `currentPatternIndex` 并更新 `lastPaddingTime`，实现循环遍历所有填充元组。
+// 8. **创建 PAD_FRAME：** 调用 `NewPadFrame` 创建并返回一个 `VyperSessionFrame` 类型的 `PAD_FRAME`。
+func (ps *paddingState) generatePaddingFrame() *VyperSessionFrame {
+	if ps.currentPatternIndex == -1 || len(ps.allPatterns) == 0 {
+		return nil // 没有主动填充模式或没有配置模式
+	}
+
+	currentTuple := ps.allPatterns[ps.currentPatternIndex] // currentTuple 现在是 []int，例如 [50, 100]
+	if len(currentTuple) != 2 {
+		log.Printf("Warning: Invalid padding pattern tuple at index %d: %v", ps.currentPatternIndex, currentTuple)
+		return nil // 选定的元组格式不正确
+	}
+
+	minLen := currentTuple[0]
+	maxLen := currentTuple[1]
+
+	// 确保 minLen 不大于 maxLen，防止 rand.Intn 报错，提高健壮性
+	if minLen > maxLen {
+		minLen = maxLen // 修正不合理配置，使其至少等于 maxLen
+	}
+
+	// 生成随机长度的填充数据，实现长度的不可预测性
+	paddingLen := rand.Intn(maxLen-minLen+1) + minLen
+	padData := make([]byte, paddingLen)
+	rand.Read(padData) // 填充随机数据，进一步混淆
+
+	// 移动到下一个元组在序列中，实现循环填充
+	ps.currentPatternIndex = (ps.currentPatternIndex + 1) % len(ps.allPatterns)
+	ps.lastPaddingTime = time.Now() // 记录上次填充时间
+	return NewPadFrame(padData)
+}
+
+// newVyperConn 创建一个新的 vyperConn 实例。
+// rawConn 是底层已建立的 TCP/TLS 连接。
+// initialRule 是 Vyper 协议的初始填充规则。
+// allPatterns 是所有可用的填充模式。
+func newVyperConn(rawConn net.Conn, initialRule byte, allPatterns [][]int) *vyperConn { // 修复：allPatterns 类型
+	vc := &vyperConn{
+		Conn:         rawConn,
+		reader:       bufio.NewReader(rawConn),
+		writeBuffer:  new(bytes.Buffer),
+		readBuffer:   new(bytes.Buffer),
+		paddingState: newPaddingState(initialRule, allPatterns),
+	}
+	return vc
+}
+
+// Read 从 Vyper 连接中读取数据。它会解析 Vyper 帧，跳过填充帧，并返回 DATA_FRAME 的内容。
+// 此方法会阻塞直到有数据可用或发生错误。
+// 详细读取逻辑：
+// 1. **优先读取内部缓冲区：** 首先检查 `readBuffer` 是否有已解封装的 `DATA_FRAME` 内容。如果有，直接从中读取并返回，避免不必要的底层读取。
+// 2. **循环读取 Vyper 帧：** 如果 `readBuffer` 为空，则进入循环，从底层 `net.Conn` 读取一个完整的 Vyper 会话帧。
+// 3. **错误处理：** 如果读取底层帧失败，检查是否为 `io.EOF`（表示连接关闭），否则返回详细错误。
+// 4. **帧类型处理：**
+//    - `DATA_FRAME (0x02)`: 收到实际应用数据帧。将其 `Content` 写入 `readBuffer`，然后从 `readBuffer` 读取到传入的 `b`。这是 Vyper 协议的核心数据传输。
+//    - `PAD_FRAME (0x06)`: 收到混淆填充帧。其 `Content` 被完全丢弃，然后继续循环读取下一个帧。这实现了 Vyper 协议的混淆特性，接收方不处理填充数据。
+//    - `CLOSE_FRAME (0x04)`: 收到关闭信号帧。表示对端已关闭其写入端。返回 `io.EOF`，通知上层应用流已结束。
+//    - `ERR_FRAME (0x05)`: 收到错误帧。表示协议层发生了不可恢复的错误。返回一个包含错误信息的 `error`。
+//    - `REQ_FRAME (0x01)` / `FLOW_FRAME (0x03)` 及其他未知帧：根据 Vyper 协议栈设计，`REQ_FRAME` 和 `FLOW_FRAME` 通常由 Mux.Cool 层处理。如果在 `vyperConn` 层面（即 Vyper 协议层）收到这些帧，说明协议栈可能出现了异常或误用，因此返回一个错误。
+func (vc *vyperConn) Read(b []byte) (n int, err error) {
+	vc.readMutex.Lock()
+	defer vc.readMutex.Unlock()
+
+	// 如果内部读取缓冲区有数据，优先读取
+	if vc.readBuffer.Len() > 0 {
+		return vc.readBuffer.Read(b)
+	}
+
+	// 否则，从底层连接读取 Vyper 帧并处理
+	for {
+		frame, err := ReadVyperSessionFrame(vc.reader) // 调用通用函数
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return 0, io.EOF // 底层连接关闭
+			}
+			return 0, fmt.Errorf("读取 Vyper 会话帧失败: %w", err)
+		}
+
+		switch frame.FrameType {
+		case 0x02: // DATA_FRAME
+			// 收到数据帧，将其内容写入内部缓冲区
+			vc.readBuffer.Write(frame.Content)
+			// 然后从缓冲区读取到传入的 b
+			return vc.readBuffer.Read(b)
+		case 0x06: // PAD_FRAME
+			// 收到填充帧，直接丢弃内容，继续读取下一个帧
+			continue
+		case 0x04: // CLOSE_FRAME
+			// 收到关闭帧，表示对方已关闭写入端
+			return 0, io.EOF // 返回 EOF 信号流结束
+		case 0x05: // ERR_FRAME
+			// 收到错误帧
+			return 0, fmt.Errorf("Vyper 协议错误帧: %s", string(frame.Content))
+		case 0x01: // REQ_FRAME (此帧应由 Mux.Cool 处理，不应在 VyperConn 的 Read 中出现)
+			return 0, fmt.Errorf("Vyper 协议异常: 在数据流中收到 REQ_FRAME (应由 Mux.Cool 处理)")
+		case 0x03: // FLOW_FRAME (此帧应由 Mux.Cool 处理，不应在 VyperConn 的 Read 中出现)
+			return 0, fmt.Errorf("Vyper 协议异常: 在数据流中收到 FLOW_FRAME (应由 Mux.Cool 处理)")
+		default:
+			return 0, fmt.Errorf("Vyper 协议异常: 未知帧类型 %x", frame.FrameType)
+		}
+	}
+}
+
+// Write 将数据写入 Vyper 连接。它会将数据封装成 DATA_FRAME，并根据填充策略注入 PAD_FRAME。
+// 此方法会阻塞直到数据写入完成或发生错误。
+// 详细写入逻辑：
+// 1. **写入 DATA_FRAME：** 将传入的原始数据 `b` 封装成一个 `DATA_FRAME`。这个帧的 `FrameType` 为 `0x02`，`Sequence` 简化为 `0`（实际应用中应维护递增序列号），`Content` 为原始数据。然后将此 `DATA_FRAME` 写入到底层连接。
+// 2. **注入 PAD_FRAME (随机交错)：**
+//    - 在写入 `DATA_FRAME` 之后，立即调用 `vc.paddingState.generatePaddingFrame()` 尝试生成一个 `PAD_FRAME`。
+//    - 如果 `generatePaddingFrame()` 返回一个有效的 `PAD_FRAME`（表示当前填充模式要求发送填充），则将此 `PAD_FRAME` 写入到底层连接。
+//    - 这种在实际数据帧之后随机插入填充帧的行为，实现了 Vyper 协议规范 Section 6.2 中描述的“随机交错”特性。
+//    - 由于 `generatePaddingFrame` 的内部逻辑会循环遍历填充模式，且没有“停止”计数器，这同时实现了 Section 6.3 的“缺乏停止计数器”特性，确保填充在连接生命周期内持续活跃。
+//    - 填充帧的写入失败通常被视为非致命错误，仅记录日志，不中断主数据流，以保持协议的韧性。
+// 3. **返回写入长度：** 最终返回成功写入的原始数据 `b` 的长度。
+func (vc *vyperConn) Write(b []byte) (n int, err error) {
+	vc.writeMutex.Lock()
+	defer vc.writeMutex.Unlock()
+
+	// 1. 写入 DATA_FRAME
+	dataFrame := &VyperSessionFrame{ // 使用通用结构
+		FrameType: 0x02, // DATA_FRAME
+		Sequence:  0,    // 简化：实际应用中应维护递增序列号
+		Content:   b,
+	}
+	if _, err := WriteFrame(vc.Conn, dataFrame); err != nil { // 调用通用函数
+		return 0, fmt.Errorf("写入 DATA_FRAME 失败: %w", err)
+	}
+
+	// 2. 注入 PAD_FRAME (随机交错)
+	// 根据协议，PAD_FRAME 可以随机交错。这里选择在每次写入 DATA_FRAME 后尝试注入一个。
+	// 这实现了“随机交错”和“缺乏停止计数器”的特性。
+	if padFrame := vc.paddingState.generatePaddingFrame(); padFrame != nil {
+		if _, err := WriteFrame(vc.Conn, padFrame); err != nil { // 调用通用函数
+			// 填充帧写入失败通常不是致命错误，记录日志并继续
+			log.Printf("VyperConn: 写入 PAD_FRAME 失败: %v", err)
+		}
+	}
+
+	return len(b), nil
+}
+
+// Close 关闭 Vyper 连接。它会发送一个 CLOSE_FRAME，然后关闭底层连接。
+func (vc *vyperConn) Close() error {
+	vc.writeMutex.Lock()
+	defer vc.writeMutex.Unlock()
+
+	closeFrame := &VyperSessionFrame{FrameType: 0x04, Sequence: 0, Content: []byte{}} // 使用通用结构
+	if _, err := WriteFrame(vc.Conn, closeFrame); err != nil { // 调用通用函数
+		log.Printf("VyperConn: 发送 CLOSE_FRAME 失败: %v", err)
+		// 即使发送失败，也要尝试关闭底层连接
+	}
+	return vc.Conn.Close()
+}
+
+// LocalAddr 返回底层连接的本地网络地址。
+func (vc *vyperConn) LocalAddr() net.Addr {
+	return vc.Conn.LocalAddr()
+}
+
+// RemoteAddr 返回底层连接的远程网络地址。
+func (vc *vyperConn) RemoteAddr() net.Addr {
+	return vc.Conn.RemoteAddr()
+}
+
+// SetDeadline 设置底层连接的读写截止时间。
+func (vc *vyperConn) SetDeadline(t time.Time) error {
+	return vc.Conn.SetDeadline(t)
+}
+
+// SetReadDeadline 设置底层连接的读取截止时间。
+func (vc *vyperConn) SetReadDeadline(t time.Time) error {
+	return vc.Conn.SetReadDeadline(t)
+}
+
+// SetWriteDeadline 设置底层连接的写入截止时间。
+func (vc *vyperConn) SetWriteDeadline(t time.Time) error {
+	return vc.Conn.SetWriteDeadline(t)
+}
+
+// =============================================================================
 // Inbound 接口和 TCPInbound 实现
-// 此文件依赖于 protocol 包中其他文件（例如 frame.go, mux.go）定义的通用结构和辅助函数。
 // =============================================================================
 
 // Inbound 抽象入口，所有入站流量都通过这个接口进行监听和接受。
