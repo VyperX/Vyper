@@ -34,6 +34,7 @@ type vyperConn struct {
 	reader *bufio.Reader // 带缓冲的读取器，用于高效读取底层连接
 
 	// 写入相关
+	writeBuffer  *bytes.Buffer // 用于构建出站 Vyper 帧，修复：添加缺失的 writeBuffer 字段
 	writeMutex   sync.Mutex    // 保护写入操作，确保并发写入的安全性
 	paddingState *paddingState // 填充状态，用于管理出站流量的混淆填充
 
@@ -45,7 +46,7 @@ type vyperConn struct {
 // paddingState 结构体用于管理当前连接的填充状态。
 // 它包含了动态突发协商和随机交错所需的所有参数。
 type paddingState struct {
-	allPatterns          [][]int   // 所有可用的填充模式，每个模式是长度范围的序列
+	allPatterns          [][][]int // 修复：改为 [][][]int，因为每个模式是 (min, max) 元组的序列
 	currentPatternIndex  int       // 当前选定的填充模式的索引
 	currentStepInPattern int       // 当前模式中，下一个要发送的 PAD_FRAME 的步骤索引
 	lastPaddingTime      time.Time // 上次发送填充帧的时间，可用于未来实现基于时间的填充间隔
@@ -54,7 +55,7 @@ type paddingState struct {
 // newPaddingState 初始化填充状态。
 // initialRule: Vyper Initialization Frame 中协商的初始填充规则。
 // allPatterns: 客户端或服务器配置的所有“Padding Burst Patterns”。
-func newPaddingState(initialRule byte, allPatterns [][]int) *paddingState {
+func newPaddingState(initialRule byte, allPatterns [][][]int) *paddingState { // 修复：allPatterns 类型
 	ps := &paddingState{
 		allPatterns:     allPatterns,
 		lastPaddingTime: time.Now(),
@@ -91,7 +92,7 @@ func (ps *paddingState) generatePaddingFrame() *VyperSessionFrame {
 		return nil // 没有主动填充模式或没有配置模式
 	}
 
-	selectedPattern := ps.allPatterns[ps.currentPatternIndex]
+	selectedPattern := ps.allPatterns[ps.currentPatternIndex] // selectedPattern 现在是 [][]int
 	if len(selectedPattern) == 0 {
 		return nil // 选定的模式为空
 	}
@@ -101,8 +102,8 @@ func (ps *paddingState) generatePaddingFrame() *VyperSessionFrame {
 		ps.currentStepInPattern = 0
 	}
 
-	minLen := selectedPattern[ps.currentStepInPattern][0]
-	maxLen := selectedPattern[ps.currentStepInPattern][1]
+	minLen := selectedPattern[ps.currentStepInPattern][0] // 修复：现在 selectedPattern[step] 是 []int，可以索引 [0]
+	maxLen := selectedPattern[ps.currentStepInPattern][1] // 修复：现在 selectedPattern[step] 是 []int，可以索引 [1]
 
 	// 确保 minLen 不大于 maxLen，防止 rand.Intn 报错，提高健壮性
 	if minLen > maxLen {
@@ -123,11 +124,11 @@ func (ps *paddingState) generatePaddingFrame() *VyperSessionFrame {
 // rawConn 是底层已建立的 TCP/TLS 连接。
 // initialRule 是 Vyper 协议的初始填充规则。
 // allPatterns 是所有可用的填充模式。
-func newVyperConn(rawConn net.Conn, initialRule byte, allPatterns [][]int) *vyperConn {
+func newVyperConn(rawConn net.Conn, initialRule byte, allPatterns [][][]int) *vyperConn { // 修复：allPatterns 类型
 	vc := &vyperConn{
 		Conn:         rawConn,
 		reader:       bufio.NewReader(rawConn),
-		writeBuffer:  new(bytes.Buffer),
+		writeBuffer:  new(bytes.Buffer), // 修复：现在 vyperConn 结构体中已包含此字段
 		readBuffer:   new(bytes.Buffer),
 		paddingState: newPaddingState(initialRule, allPatterns),
 	}
@@ -285,7 +286,7 @@ type TCPOutbound struct {
 	authToken          string        // Vyper 协议的 AuthToken，用于认证
 	initialPaddingRule byte          // 客户端初始填充规则
 	clientInfo         string        // 客户端信息字符串，用于伪装 HTTP User-Agent
-	paddingPatterns    [][]int       // 客户端定义的填充模式列表
+	paddingPatterns    [][][]int     // 修复：改为 [][][]int
 	mu                 sync.Mutex    // 互斥锁，用于保护 closed 字段
 	closed             bool          // 标记 Outbound 是否已关闭
 }
@@ -303,7 +304,7 @@ func NewTCPOutbound(timeout time.Duration) *TCPOutbound {
 // initialPaddingRule 是客户端希望使用的初始填充规则。
 // clientInfo 是客户端信息字符串，用于伪装 HTTP User-Agent。
 // paddingPatterns 是客户端定义的填充模式列表。
-func NewTLSOutbound(timeout time.Duration, tlsConfig *tls.Config, authToken string, initialPaddingRule byte, clientInfo string, paddingPatterns [][]int) *TCPOutbound {
+func NewTLSOutbound(timeout time.Duration, tlsConfig *tls.Config, authToken string, initialPaddingRule byte, clientInfo string, paddingPatterns [][][]int) *TCPOutbound { // 修复：paddingPatterns 类型
 	return &TCPOutbound{
 		timeout:            timeout,
 		tlsConfig:          tlsConfig,
