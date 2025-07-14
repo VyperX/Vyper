@@ -4,98 +4,99 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time" // 用于 Timeout 字段，表示秒
 
 	"gopkg.in/yaml.v3"
 )
 
-// Config holds all configuration parameters for the Vyper client.
-// It uses a flat structure as preferred.
+// Config 包含了 Vyper 客户端的所有配置参数。
+// 结构扁平化，符合您期望的风格。
 type Config struct {
-	// --- Vyper Protocol Core Settings ---
-	ServerAddress      string `yaml:"serverAddress"`       // Vyper server address (domain or IP)
-	ServerPort         int    `yaml:"serverPort"`          // Vyper server port
-	AuthToken          string `yaml:"authToken"`           // Pre-shared authentication token (Base64 encoded)
-	InitialPaddingRule int    `yaml:"initialPaddingRule"`  // Initial padding rule index (0-255)
-	ClientInfo         string `yaml:"clientInfo"`          // Optional client software info string
+	// --- 基础连接与核心 Vyper 参数 (您的原始参数) ---
+	ServerIP           string `yaml:"server_ip"`           // 必填：Vyper 服务器的 IP 地址或域名
+	ServerPort         int    `yaml:"server_port"`         // 必填：Vyper 服务器的端口
+	AuthToken          string `yaml:"auth_token"`          // 必填：用于认证的预共享 Auth Token (Base64 编码)
+	BufferSize         int    `yaml:"buffer_size"`         // 可选：数据传输缓冲区大小 (字节)
+	Timeout            int    `yaml:"timeout"`             // 可选：连接超时时间 (秒)
 
-	// --- TLS Settings ---
-	TLSEnabled         bool   `yaml:"tlsEnabled"`          // Whether TLS is enabled (must be true for Vyper)
-	TLSServerName      string `yaml:"tlsServerName"`       // TLS SNI (Server Name Indication)
-	TLSInsecureSkipVerify bool   `yaml:"tlsInsecureSkipVerify"` // Whether to skip server certificate verification
-	TLSCACertPath      string `yaml:"tlsCACertPath"`       // Path to custom CA cert bundle for verification
-	TLSClientCertPath  string `yaml:"tlsClientCertPath"`   // Path to client's TLS certificate
-	TLSClientKeyPath   string `yaml:"tlsClientKeyPath"`    // Path to client's TLS private key
+	// --- Vyper 协议特有参数 ---
+	InitialPaddingRule int    `yaml:"initialPaddingRule"`  // 必填：初始填充规则索引 (0-255)
+	ClientInfo         string `yaml:"clientInfo"`          // 可选：客户端软件信息字符串
 
-	// --- Local Proxy Listener Settings ---
-	ProxyListenAddress string `yaml:"proxyListenAddress"`  // Local address for proxy listener
-	ProxyListenPort    int    `yaml:"proxyListenPort"`     // Local port for proxy listener
-	ProxyProtocol      string `yaml:"proxyProtocol"`       // Type of local proxy protocol (e.g., "socks5", "http")
+	// --- TLS (传输层安全) 配置 ---
+	TLSEnabled         bool   `yaml:"tlsEnabled"`          // 必填：是否启用 TLS (Vyper 协议必须为 true)
+	TLSServerName      string `yaml:"tlsServerName"`       // 必填：TLS SNI (Server Name Indication)
+	TLSInsecureSkipVerify bool   `yaml:"tlsInsecureSkipVerify"` // 必填：是否跳过服务器证书验证 (生产环境应为 false)
+	TLSCACertPath      string `yaml:"tlsCACertPath"`       // 可选：自定义 CA 证书路径 (PEM 格式)
+	TLSClientCertPath  string `yaml:"tlsClientCertPath"`   // 可选：客户端 TLS 证书路径 (PEM 格式，如果服务器需要)
+	TLSClientKeyPath   string `yaml:"tlsClientKeyPath"`    // 可选：客户端 TLS 私钥路径 (PEM 格式)
 
-	// --- General/Utility Settings ---
-	BufferSize         int    `yaml:"bufferSize"`          // Buffer size for data transfer in bytes
-	Timeout            int    `yaml:"timeout"`             // Connection timeout in seconds
+	// --- 本地代理监听配置 ---
+	ProxyListenAddress string `yaml:"proxyListenAddress"`  // 必填：本地代理监听地址
+	ProxyListenPort    int    `yaml:"proxyListenPort"`     // 必填：本地代理监听端口
+	ProxyProtocol      string `yaml:"proxyProtocol"`       // 可选：本地代理协议类型 (例如 "socks5", "http")
 }
 
-// LoadConfig reads and parses the client configuration from config.yaml.
-// It searches for config.yaml in the executable's directory and a 'config' subdirectory.
+// LoadConfig 读取并解析 config.yaml 文件中的客户端配置。
+// 它会在可执行文件目录及其 'config' 子目录中查找 config.yaml。
 func LoadConfig() (*Config, error) {
 	execPath, err := os.Executable()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get executable path: %w", err)
+		return nil, fmt.Errorf("无法获取可执行文件路径: %w", err)
 	}
 	execDir := filepath.Dir(execPath)
 
-	// Define potential paths for config.yaml
+	// 定义 config.yaml 的可能路径
 	configPaths := []string{
-		filepath.Join(execDir, "config.yaml"),            // config.yaml directly in executable dir
+		filepath.Join(execDir, "config.yaml"),            // 可执行文件目录下
 		filepath.Join(execDir, "config", "config.yaml"), // config/config.yaml
 	}
 
 	var data []byte
 	var foundPath string
 	for _, p := range configPaths {
-		if _, err := os.Stat(p); err == nil { // Check if file exists
+		if _, err := os.Stat(p); err == nil { // 检查文件是否存在
 			data, err = os.ReadFile(p)
 			if err != nil {
-				return nil, fmt.Errorf("failed to read config file %s: %w", p, err)
+				return nil, fmt.Errorf("无法读取配置文件 %s: %w", p, err)
 			}
 			foundPath = p
-			break // Found the file, stop searching
+			break // 找到文件，停止搜索
 		}
 	}
 
 	if data == nil {
-		return nil, fmt.Errorf("config.yaml not found in expected locations: %v", configPaths)
+		return nil, fmt.Errorf("在预期位置未找到 config.yaml: %v", configPaths)
 	}
 
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config file %s: %w", foundPath, err)
+		return nil, fmt.Errorf("无法解析配置文件 %s: %w", foundPath, err)
 	}
 
-	// --- Basic Validation and Default Values ---
-	if cfg.ServerAddress == "" || cfg.ServerPort == 0 {
-		return nil, fmt.Errorf("missing essential Vyper server connection details (serverAddress, serverPort)")
+	// --- 基本验证和默认值设置 ---
+	if cfg.ServerIP == "" || cfg.ServerPort == 0 {
+		return nil, fmt.Errorf("缺少 Vyper 服务器连接基本信息 (server_ip, server_port)")
 	}
 	if cfg.AuthToken == "" {
-		return nil, fmt.Errorf("authToken is missing, which is required for authentication")
+		return nil, fmt.Errorf("auth_token 缺失，认证必需")
 	}
 	if !cfg.TLSEnabled {
-		return nil, fmt.Errorf("TLS must be enabled for Vyper protocol")
+		return nil, fmt.Errorf("Vyper 协议必须启用 TLS (tlsEnabled 需为 true)")
 	}
 	if cfg.TLSServerName == "" && !cfg.TLSInsecureSkipVerify {
-		return nil, fmt.Errorf("TLS is enabled but tlsServerName is missing and tlsInsecureSkipVerify is false")
+		return nil, fmt.Errorf("TLS 已启用但 tlsServerName 缺失，且 tlsInsecureSkipVerify 为 false")
 	}
 	if cfg.ProxyListenAddress == "" || cfg.ProxyListenPort == 0 {
-		return nil, fmt.Errorf("missing essential proxy listen details (proxyListenAddress, proxyListenPort)")
+		return nil, fmt.Errorf("缺少本地代理监听信息 (proxyListenAddress, proxyListenPort)")
 	}
 
-	// Set defaults if not provided
+	// 设置默认值 (如果未提供)
 	if cfg.BufferSize == 0 {
-		cfg.BufferSize = 4096 // Default buffer size in bytes
+		cfg.BufferSize = 4096 // 默认缓冲区大小为 4096 字节
 	}
 	if cfg.Timeout == 0 {
-		cfg.Timeout = 30 // Default connection timeout in seconds
+		cfg.Timeout = 30 // 默认连接超时为 30 秒
 	}
 
 	return &cfg, nil
