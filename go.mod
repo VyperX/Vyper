@@ -6,6 +6,7 @@ require github.com/v2fly/v2ray-core/v5 v5.37.0
 
 require (
 	github.com/adrg/xdg v0.5.3
+	github.com/ajg/form v1.5.1
 	github.com/apernet/quic-go v0.48.2-0.20241104191913-cb103fcecfe7
 	github.com/go-chi/chi/v5 v5.2.2
 	github.com/go-chi/render v1.0.3
