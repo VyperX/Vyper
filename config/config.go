@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time" // 用于 Timeout 字段，表示秒
 
 	"gopkg.in/yaml.v3"
 )
