@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/UltraTLS/UltraTLS/protocol" // 假设 protocol 包在这里
-	"vyper/config" // 假设 config 包在这里
+	"github.com/UltraTLS/UltraTLS/config" 
 	"github.com/v2fly/v2ray-core/v5/common/net" // 假设这个包可用
 )
 
