@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"crypto/tls" // 引入 TLS 包以加载证书池
 	"crypto/x509" // 引入 x509 包以处理证书
 )
 
