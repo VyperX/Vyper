@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"crypto/x509" // 引入 x509 包以处理证书
+	"log" // 引入 log 以用于调试信息
 )
 
 // --- Vyper Initialization Frame 的结构 (此结构在 server.go 中被使用，因此此处也需要定义) ---
@@ -131,4 +132,81 @@ func WriteFrame(w io.Writer, frame *VyperSessionFrame) (int, error) {
 	}
 
 	return n + contentN, nil // 返回总写入字节数
+}
+
+// WriteVyperInitializationFrame 将一个 VyperInitializationFrame 写入到 io.Writer。
+// 它严格遵循 Vyper 协议中初始化帧的字节格式和顺序。
+func WriteVyperInitializationFrame(w io.Writer, frame *VyperInitializationFrame) (int, error) {
+	totalN := 0
+
+	// 1. 写入 AuthBlob Length (2 字节, Big-Endian uint16)
+	authBlobLen := uint16(len(frame.AuthBlob))
+	if err := binary.Write(w, binary.BigEndian, authBlobLen); err != nil {
+		return totalN, fmt.Errorf("写入 AuthBlob Length 失败: %w", err)
+	}
+	totalN += 2
+
+	// 2. 写入 AuthBlob (变长)
+	n, err := w.Write(frame.AuthBlob)
+	if err != nil {
+		return totalN + n, fmt.Errorf("写入 AuthBlob 失败: %w", err)
+	}
+	totalN += n
+
+	// 3. 写入 InitialPaddingRule (1 字节)
+	if err := binary.Write(w, binary.BigEndian, frame.InitialPaddingRule); err != nil {
+		return totalN, fmt.Errorf("写入 InitialPaddingRule 失败: %w", err)
+	}
+	totalN += 1
+
+	// 4. 写入 Reserved (3 字节)
+	n, err = w.Write(frame.Reserved)
+	if err != nil {
+		return totalN + n, fmt.Errorf("写入 Reserved 字段失败: %w", err)
+	}
+	totalN += n
+
+	// 5. 写入 ClientInfo Length (2 字节, Big-Endian uint16)
+	clientInfoLen := uint16(len(frame.ClientInfo))
+	if err := binary.Write(w, binary.BigEndian, clientInfoLen); err != nil {
+		return totalN, fmt.Errorf("写入 ClientInfo Length 失败: %w", err)
+	}
+	totalN += 2
+
+	// 6. 写入 ClientInfo (变长)
+	n, err = w.Write([]byte(frame.ClientInfo))
+	if err != nil {
+		return totalN + n, fmt.Errorf("写入 ClientInfo 失败: %w", err)
+	}
+	totalN += n
+
+	return totalN, nil
+}
+
+// ReadVyperSessionFrame 从 io.Reader 读取一个完整的 VyperSessionFrame。
+// 它遵循 Vyper 协议中会话帧的字节格式。
+func ReadVyperSessionFrame(r io.Reader) (*VyperSessionFrame, error) {
+	frame := &VyperSessionFrame{}
+	header := make([]byte, 7) // FrameType (1B) + Sequence (4B) + Content Length (2B)
+
+	// 读取帧头
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, fmt.Errorf("读取会话帧头失败: %w", err)
+	}
+
+	frame.FrameType = header[0]
+	frame.Sequence = binary.BigEndian.Uint32(header[1:5])
+	contentLen := binary.BigEndian.Uint16(header[5:7])
+
+	// 读取帧内容
+	if contentLen > 0 {
+		frame.Content = make([]byte, contentLen)
+		if _, err := io.ReadFull(r, frame.Content); err != nil {
+			return nil, fmt.Errorf("读取会话帧内容失败 (预期长度 %d): %w", contentLen, err)
+		}
+	} else {
+		frame.Content = []byte{} // 内容长度为0时，设为空字节切片
+	}
+
+	return frame, nil
 }
