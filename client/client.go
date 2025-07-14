@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http" // 用于构建伪HTTP请求
 	"time"
@@ -21,12 +22,62 @@ import (
 // ClientConfig 配置结构（可扩展）
 type ClientConfig struct {
 	LocalListen string                  // 本地监听地址
-	Handler     func(stream protocol.Stream)
+	Handler     func(stream protocol.Stream) // Mux.Cool 层的处理函数
 }
+
+// paddingState 结构体用于管理当前连接的填充状态
+type paddingState struct {
+	patternIndex int          // 当前使用的填充模式索引
+	pattern      [][]int      // 当前填充模式，例如 [[50, 100], [120, 200]]
+	step         int          // 当前模式中的步骤
+	lastPaddingTime time.Time // 上次发送填充帧的时间
+}
+
+// newPaddingState 初始化填充状态
+func newPaddingState(initialRule byte, patterns [][]int) *paddingState {
+	ps := &paddingState{
+		lastPaddingTime: time.Now(),
+	}
+	// 根据 initialRule 选择模式
+	if initialRule >= 0x01 && int(initialRule-1) < len(patterns) {
+		ps.patternIndex = int(initialRule - 1)
+		ps.pattern = patterns[ps.patternIndex]
+	} else {
+		// 如果 initialRule 是 0x00 (无主动填充) 或 0xFF (服务器决定)
+		// 或者索引超出范围，则使用一个空模式（不主动填充）
+		ps.pattern = [][]int{}
+	}
+	return ps
+}
+
+// generatePaddingFrame 根据当前填充状态生成一个 PAD_FRAME
+// 返回 PAD_FRAME 和是否生成了帧
+func (ps *paddingState) generatePaddingFrame() *protocol.VyperSessionFrame {
+	if len(ps.pattern) == 0 {
+		return nil // 没有主动填充模式
+	}
+
+	// 按照模式步骤生成填充
+	if ps.step >= len(ps.pattern) {
+		ps.step = 0 // 循环模式
+	}
+
+	minLen := ps.pattern[ps.step][0]
+	maxLen := ps.pattern[ps.step][1]
+
+	paddingLen := rand.Intn(maxLen-minLen+1) + minLen
+	padData := make([]byte, paddingLen)
+	rand.Read(padData) // 填充随机数据
+
+	ps.step++
+	ps.lastPaddingTime = time.Now()
+	return protocol.NewPadFrame(padData)
+}
+
 
 func StartClient(cfg *ClientConfig) error {
 	// === 1. 读取配置 ===
-	conf, err := config.LoadClientConfig()
+	conf, err := config.LoadConfig() // 使用 LoadConfig
 	if err != nil {
 		log.Fatalf("无法加载配置: %v", err)
 	}
@@ -84,83 +135,21 @@ func handleConnection(clientConn net.Conn, conf *config.Config, handler func(pro
 		tlsConfig.Certificates = []tls.Certificate{clientCert}
 	}
 
-	serverConn, err := tls.Dial("tcp", serverAddr, tlsConfig)
+	// 使用 protocol.NewTLSOutbound 建立连接，它会处理 TLS 握手
+	outbound := protocol.NewTLSOutbound(time.Duration(conf.Timeout)*time.Second, tlsConfig, conf.AuthToken, byte(conf.InitialPaddingRule), conf.ClientInfo)
+	serverConn, err := outbound.Connect("tcp", serverAddr)
 	if err != nil {
 		log.Printf("客户端连接到 Vyper 服务器 %s 失败: %v", serverAddr, err)
 		return
 	}
+	defer outbound.Close() // 关闭 outbound 实例，但不会关闭 serverConn
 	defer serverConn.Close()
 	log.Printf("已连接到 Vyper 服务器 %s", serverAddr)
 
-	// === 3. Vyper 协议认证阶段 ===
-	// 3.1 构造 AuthBlob
-	// 假设 conf.AuthToken 在这里是直接可用的字符串，可以转换为 []byte
-	authBlob := []byte(conf.AuthToken)
-
-	// 3.2 构造 SessionToken 的伪 HTTP 请求
-	// SessionToken = SHA256(当前时间戳(s) + AuthToken) 的前 4 字节
-	currentTimeSeconds := time.Now().Unix()
-	sessionTokenData := make([]byte, 8) // 8字节用于时间戳，确保与服务器端的 PutUint64 匹配
-	binary.BigEndian.PutUint64(sessionTokenData[:], uint64(currentTimeSeconds))
-	sessionTokenData = append(sessionTokenData, []byte(conf.AuthToken)...) // 拼接 AuthToken
-
-	hasher := sha256.New()
-	hasher.Write(sessionTokenData)
-	sessionTokenHash := hasher.Sum(nil)
-	calculatedSessionToken := sessionTokenHash[:4] // 取前 4 字节作为 SessionToken
-
-	base64EncodedSessionToken := base64.StdEncoding.EncodeToString(calculatedSessionToken)
-
-	// 构建一个伪 HTTP GET 请求作为 ClientInfo
-	// 路径是 "/SessionToken/<Base64编码的SessionToken>"
-	// 确保这是一个完整的HTTP请求，带有Host头和空行，以便服务器的 http.ReadRequest 能正确解析
-	httpReqPath := fmt.Sprintf("/SessionToken/%s", base64EncodedSessionToken)
-	httpReqBody := new(bytes.Buffer)
-	httpReq, _ := http.NewRequest("GET", httpReqPath, nil)
-	httpReq.Host = conf.TLSServerName // 使用 TLS ServerName 作为 Host 头
-	httpReq.Header.Set("User-Agent", conf.ClientInfo) // 可以使用 ClientInfo 作为 User-Agent
-	httpReq.Header.Set("Connection", "keep-alive")
-	_ = httpReq.Write(httpReqBody) // 将请求写入 buffer
-
-	clientInfo := httpReqBody.String() // 获取完整的 HTTP 请求字符串
-
-	// 3.3 构造 Vyper Initialization Frame
-	initFrame := &protocol.VyperInitializationFrame{
-		AuthBlob:           authBlob,
-		InitialPaddingRule: byte(conf.InitialPaddingRule),
-		Reserved:           []byte{0x00, 0x00, 0x00}, // 3 字节保留，全部为 0x00
-		ClientInfo:         clientInfo,
-	}
-
-	// 3.4 写入 Vyper Initialization Frame
-	if _, err := protocol.WriteVyperInitializationFrame(serverConn, initFrame); err != nil { // 假设 WriteVyperInitializationFrame 存在于 protocol 包
-		log.Printf("写入 Vyper 初始化帧失败: %v", err)
-		return
-	}
-	log.Printf("Vyper 初始化帧已发送")
-
-	// 3.5 读取服务器的认证响应 (PAD_FRAME)
-	// 服务器认证成功后会回复一个 PAD_FRAME (900-1400字节)
-	responseFrame, err := protocol.ReadVyperSessionFrame(serverConn) // 假设 ReadVyperSessionFrame 存在于 protocol 包
-	if err != nil {
-		log.Printf("读取服务器认证响应帧失败: %v", err)
-		return
-	}
-
-	if responseFrame.FrameType != 0x06 { // 0x06 是 PAD_FRAME 的 FrameType
-		log.Printf("服务器认证响应帧类型不正确: 预期 0x06 (PAD_FRAME), 实际 %x", responseFrame.FrameType)
-		return
-	}
-	if len(responseFrame.Content) < 900 || len(responseFrame.Content) > 1400 {
-		log.Printf("服务器认证响应填充帧长度不符合要求: 实际 %d, 预期 900-1400", len(responseFrame.Content))
-		// 根据协议，如果长度不符，可能也是认证失败或协议异常
-		return
-	}
-	log.Printf("Vyper 服务器认证成功，收到填充帧，长度 %d", len(responseFrame.Content))
-
+	// === 3. Vyper 协议认证阶段 (现在由 protocol.NewTLSOutbound 内部处理) ===
+	// 如果 Connect 返回成功，则表示认证已通过
 
 	// === 4. 建立 Mux.Cool Session ===
-	// 组装 v2net.Address 和 v2net.Port (Mux.Cool 需要这些)
 	var (
 		destAddr v2net.Address
 		destPort v2net.Port
@@ -172,16 +161,12 @@ func handleConnection(clientConn net.Conn, conf *config.Config, handler func(pro
 	}
 	destPort = v2net.Port(conf.ServerPort)
 
-	session := protocol.NewSession(serverConn) // 在这里传递认证成功后的 serverConn
+	session := protocol.NewSession(serverConn)
 	defer session.Close()
 	log.Printf("Mux.Cool 会话已建立")
 
-	// === 5. 开一个 Mux.Cool 子流，目标是服务器的内部 Mux.Cool 处理逻辑 ===
-	// 对于客户端，这个子流的目标通常不是外部目的地，而是 Mux.Cool 本身。
-	// 这里使用服务器的地址和端口作为 Mux 内部路由的示意目的地，具体取决于 Mux.Cool 的实现。
-	// 实际场景中，客户端可能需要一个真实的代理目标来通过 OpenStream 传输。
-	// 假设这里仅仅是建立一个到 Mux 协议层面的子流。
-	dest := v2net.TCPDestination(destAddr, destPort) // 这是一个占位符，实际目标应由客户端的代理请求决定
+	// === 5. 开一个 Mux.Cool 子流 ===
+	dest := v2net.TCPDestination(destAddr, destPort)
 	stream, err := session.OpenStream(dest)
 	if err != nil {
 		log.Printf("客户端打开 Mux 子流失败: %v", err)
@@ -190,26 +175,89 @@ func handleConnection(clientConn net.Conn, conf *config.Config, handler func(pro
 	defer stream.Close()
 	log.Printf("Mux.Cool 子流已打开")
 
-	// === 6. 双向转发数据 ===
-	// 将客户端连接的输入转发到 Mux 子流，并将 Mux 子流的输出转发回客户端连接
-	if handler != nil {
-		handler(stream) // 如果有自定义 handler，则交给 handler 处理
-	} else {
-		// 常规的双向数据转发
-		go func() {
-			_, err := io.Copy(stream, clientConn)
-			if err != nil && err != io.EOF {
-				log.Printf("客户端到 Mux 子流的数据转发错误: %v", err)
+	// === 6. 双向转发数据，并注入填充 ===
+	// 初始化填充状态
+	clientPaddingState := newPaddingState(byte(conf.InitialPaddingRule), conf.PaddingPatterns)
+	serverPaddingState := newPaddingState(0x00, nil) // 客户端接收填充时，不需要主动生成，只丢弃
+
+	// 从 clientConn 读取数据，封装成 DATA_FRAME，注入 PAD_FRAME，然后写入 stream
+	go func() {
+		buf := make([]byte, conf.BufferSize)
+		for {
+			n, err := clientConn.Read(buf)
+			if n > 0 {
+				// 封装为 DATA_FRAME 并写入 Mux.Cool stream
+				dataFrame := &protocol.VyperSessionFrame{
+					FrameType: 0x02, // DATA_FRAME
+					Sequence:  0,    // 简化，实际应有递增序列号
+					Content:   buf[:n],
+				}
+				if _, writeErr := protocol.WriteFrame(stream, dataFrame); writeErr != nil {
+					log.Printf("客户端写入 DATA_FRAME 到 Mux 子流失败: %v", writeErr)
+					break
+				}
+				// 注入填充帧
+				if padFrame := clientPaddingState.generatePaddingFrame(); padFrame != nil {
+					if _, writeErr := protocol.WriteFrame(stream, padFrame); writeErr != nil {
+						log.Printf("客户端写入 PAD_FRAME 到 Mux 子流失败: %v", writeErr)
+						// 非致命错误，可以继续
+					}
+				}
 			}
-			// 考虑在这里关闭 stream 的写入端，通知服务器不再发送数据
-			// if closer, ok := stream.(io.Closer); ok { // 如果 stream 是 ReadWriteCloser
-			// 	closer.CloseWrite() // 假设有 CloseWrite 方法
-			// }
-		}()
-		_, err := io.Copy(clientConn, stream)
-		if err != nil && err != io.EOF {
-			log.Printf("Mux 子流到客户端的数据转发错误: %v", err)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("从客户端读取数据错误: %v", err)
+				}
+				// 发送 CLOSE_FRAME 通知服务器流关闭
+				closeFrame := &protocol.VyperSessionFrame{FrameType: 0x04, Sequence: 0, Content: []byte{}}
+				if _, writeErr := protocol.WriteFrame(stream, closeFrame); writeErr != nil {
+					log.Printf("客户端写入 CLOSE_FRAME 到 Mux 子流失败: %v", writeErr)
+				}
+				break
+			}
+		}
+	}()
+
+	// 从 stream 读取数据，解封装，处理 PAD_FRAME，然后写入 clientConn
+	buf := make([]byte, conf.BufferSize)
+	for {
+		// 读取 Vyper Session Frame
+		responseFrame, err := protocol.ReadVyperSessionFrame(stream)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("从 Mux 子流读取 Vyper 帧错误: %v", err)
+			}
+			break
+		}
+
+		switch responseFrame.FrameType {
+		case 0x02: // DATA_FRAME
+			if len(responseFrame.Content) > 0 {
+				if _, writeErr := clientConn.Write(responseFrame.Content); writeErr != nil {
+					log.Printf("客户端写入 DATA_FRAME 内容到本地连接失败: %v", writeErr)
+					break
+				}
+			}
+		case 0x06: // PAD_FRAME
+			// 收到填充帧，直接丢弃内容
+			// log.Printf("客户端收到 PAD_FRAME，长度 %d", len(responseFrame.Content))
+		case 0x04: // CLOSE_FRAME
+			log.Printf("客户端收到 CLOSE_FRAME，关闭本地连接写入端")
+			// 收到关闭帧，关闭本地连接的写入端
+			if closer, ok := clientConn.(interface{ CloseWrite() error }); ok {
+				closer.CloseWrite()
+			} else {
+				clientConn.Close() // 如果不支持 CloseWrite，则直接关闭整个连接
+			}
+			break // 退出读取循环
+		case 0x05: // ERR_FRAME
+			log.Printf("客户端收到 ERR_FRAME: %s", string(responseFrame.Content))
+			break // 收到错误帧，退出读取循环
+		default:
+			log.Printf("客户端收到未知帧类型: %x", responseFrame.FrameType)
+			// 可以选择关闭连接或忽略
 		}
 	}
+
 	log.Printf("连接处理完成，关闭连接 %s", clientConn.RemoteAddr())
 }
