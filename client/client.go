@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
@@ -10,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand" // 用于生成填充数据
 	"net"
 	"net/http" // 用于构建伪HTTP请求
 	"time"
