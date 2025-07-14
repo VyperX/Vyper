@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"io"
 )
 
 // Inbound 抽象入口，所有入站流量（TCP/UDP封装后）都用这个
