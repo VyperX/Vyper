@@ -20,7 +20,7 @@ type ClientConfig struct {
 
 func StartClient(cfg *ClientConfig) error {
 	// === 1. 读取配置 ===
-	conf, err := config.LoadConfig()
+	conf, err := config.LoadClientConfig()
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
